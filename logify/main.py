@@ -1,4 +1,4 @@
-from functools import wraps
+from functools import partial, wraps
 from typing import Any, Callable, ParamSpec, TypeVar
 
 from jax._src import linear_util as lu
@@ -19,17 +19,17 @@ def logify(f: Callable[P, T]) -> Callable[P, tuple[T, Logs]]:
     def wrapped_f(*args: P.args, **kwargs: P.kwargs) -> tuple[T, Logs]:
         # close over all arguments so they're not turned into abstract values.
         in_tree = jtu.tree_structure(((), {}))
-        closed_f = lambda: f(*args, **kwargs)
+        closed_f = partial(f, *args, **kwargs)
 
         # stage
-        fun_, out_tree = flatten_fun(lu.wrap_init(closed_f), in_tree)
-        debug = pe.debug_info(closed_f, in_tree, out_tree, False, "logify")
-        jaxpr_, _, args = pe.trace_to_jaxpr_dynamic(fun_, (), debug)
+        fun_, out_tree_fn = flatten_fun(lu.wrap_init(closed_f), in_tree)
+        debug = pe.debug_info(closed_f, in_tree, out_tree_fn, False, "logify")
+        jaxpr_, _, consts = pe.trace_to_jaxpr_dynamic(fun_, (), debug)
         jaxpr = pe.close_jaxpr(pe.convert_constvars_jaxpr(jaxpr_))
 
         # logify
-        out_flat, logs = logify_jaxpr(jaxpr.jaxpr, jaxpr.consts, Logs(), *args)
-        return jtu.tree_unflatten(out_tree(), out_flat), logs
+        out_flat, logs = logify_jaxpr(jaxpr, Logs(), *consts)
+        return jtu.tree_unflatten(out_tree_fn(), out_flat), logs
 
     return wrapped_f
 
