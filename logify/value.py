@@ -15,11 +15,14 @@ class Logs:
     def __repr__(self):
         return f"Logs({repr(self._values)})"
 
-    def log(self, name: str, value: Array, reduction: str):
+    def init(self, name: str, value: Array, reduction: str):
         if name not in self._values:
             self._values[name] = {}
         if reduction not in self._values[name]:
-            self._values[name][reduction] = accumulators[reduction].base
+            self._values[name][reduction] = accumulators[reduction].base(value)
+
+    def log(self, name: str, value: Array, reduction: str):
+        self.init(name, value, reduction)
 
         self._values[name][reduction] = accumulators[reduction].update(
             value, self._values[name][reduction]
