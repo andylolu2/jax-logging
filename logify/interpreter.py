@@ -66,6 +66,8 @@ def logify_jaxpr_flat(
                 outvals, logs = log_cond(logs, *invals, **eqn.params)
             elif eqn.primitive is lax.scan_p:
                 outvals, logs = log_scan(logs, *invals, **eqn.params)
+            elif eqn.primitive is lax.while_p:
+                outvals, logs = log_while(logs, *invals, **eqn.params)
             else:
                 outvals = eqn.primitive.bind(*invals, **eqn.params)
 
@@ -132,6 +134,14 @@ def log_cond(
     return out, logs
 
 
+def _trace_logs(logs: Logs, jaxpr: core.ClosedJaxpr, *in_avals: core.AbstractValue):
+    log_values, log_tree = jtu.tree_flatten(logs)
+    in_avals = tuple(map(_get_shaped_aval, log_values)) + in_avals
+    new_jaxpr, out_avals, out_tree = jaxpr_to_logify_jaxpr(jaxpr, log_tree, *in_avals)
+    _, logs = jtu.tree_unflatten(out_tree, out_avals)
+    return new_jaxpr, logs
+
+
 # lax.scan
 def log_scan(
     prev_logs: Logs,
@@ -149,18 +159,11 @@ def log_scan(
 
     # We need to initialize the accumulator such that it has static shapes.
     # Step 1: Identify logs keys used in the jaxpr.
-    empty_log_values, empty_log_tree = jtu.tree_flatten(Logs())
-    in_avals = (
-        tuple(map(_get_shaped_aval, [*empty_log_values, *consts, *carry])) + xs_mapped
-    )
-    new_jaxpr, out_avals, out_tree = jaxpr_to_logify_jaxpr(
-        jaxpr, empty_log_tree, *in_avals
-    )
-    _, logs = jtu.tree_unflatten(out_tree, out_avals)
-    logs_dict = logs.asdict()
+    in_avals = tuple(map(_get_shaped_aval, [*consts, *carry])) + xs_mapped
+    _, logs = _trace_logs(Logs(), jaxpr, *in_avals)
 
     # Step 2: Modify prev_logs to include new log keys.
-    for name, reductions in logs_dict.items():
+    for name, reductions in logs.asdict().items():
         for reduction, value in reductions.items():
             if not accumulators[reduction].static_shape:
                 raise ValueError(
@@ -181,11 +184,12 @@ def log_scan(
     )
     new_jaxpr = pe.move_binders_to_front(new_jaxpr, to_move)
 
-    new_args = (*consts, *carry, *log_values, *xs)
+    new_carry = (*carry, *log_values)
+    new_args = (*consts, *new_carry, *xs)
     new_linear = (
         linear[: num_consts + num_carry]
         + (False,) * len(log_values)
-        + linear[num_consts + num_carry : num_consts + num_carry + len(xs)]
+        + linear[num_consts + num_carry :]
     )
     out_vals = lax.scan_p.bind(
         *new_args,
@@ -193,9 +197,74 @@ def log_scan(
         length=length,
         jaxpr=new_jaxpr,
         num_consts=num_consts,
-        num_carry=num_carry + len(log_values),
+        num_carry=len(new_carry),
         linear=new_linear,
         unroll=unroll,
     )
     out, logs = jtu.tree_unflatten(out_tree, out_vals)
+
+    return out, logs
+
+
+def log_while(
+    prev_logs: Logs,
+    *args,
+    cond_nconsts: int,
+    cond_jaxpr: core.ClosedJaxpr,
+    body_nconsts: int,
+    body_jaxpr: core.ClosedJaxpr,
+):
+    c_consts, b_consts, carry = split_list(args, [cond_nconsts, body_nconsts])
+
+    # We need to initialize the accumulator such that it has static shapes.
+    # Step 1: Identify logs keys used in the jaxpr.
+    # empty_log_values, empty_log_tree = jtu.tree_flatten(Logs())
+    cond_in_avals = map(_get_shaped_aval, [*c_consts, *carry])
+    _, logs = _trace_logs(Logs(), cond_jaxpr, *cond_in_avals)
+    if len(logs._values) > 0:
+        raise ValueError("Logs are not supported in the condition of lax.while_loop")
+
+    body_in_avals = map(_get_shaped_aval, [*b_consts, *carry])
+    _, logs = _trace_logs(logs, body_jaxpr, *body_in_avals)
+
+    # Step 2: Modify prev_logs to include new log keys.
+    for name, reductions in logs.asdict().items():
+        for reduction, value in reductions.items():
+            if not accumulators[reduction].static_shape:
+                raise ValueError(
+                    f"Reduction '{reduction}' is not supported with lax.while "
+                    "since it uses dynamic shapes."
+                )
+            prev_logs.init(name, value, reduction)
+
+    # Step 3: Do actual pass with the new logs
+    log_values, log_tree = jtu.tree_flatten(prev_logs)
+    cond_in_avals = map(_get_shaped_aval, [*log_values, *c_consts, *carry])
+    new_cond_jaxpr, _, out_tree = jaxpr_to_logify_jaxpr(
+        cond_jaxpr, log_tree, *cond_in_avals
+    )
+    to_move = [False] * len(log_values) + [True] * cond_nconsts + [True] * len(carry)
+    new_cond_jaxpr = pe.move_binders_to_front(new_cond_jaxpr, to_move)
+    new_cond_jaxpr = pe.prune_closed_jaxpr_outputs(
+        new_cond_jaxpr, [True] * len(carry) + [False] * len(log_values)
+    )
+
+    body_in_avals = map(_get_shaped_aval, [*log_values, *b_consts, *carry])
+    new_body_jaxpr, _, out_tree = jaxpr_to_logify_jaxpr(
+        body_jaxpr, log_tree, *body_in_avals
+    )
+    to_move = [False] * len(log_values) + [True] * body_nconsts + [True] * len(carry)
+    new_body_jaxpr = pe.move_binders_to_front(new_body_jaxpr, to_move)
+
+    new_carry = (*carry, *log_values)
+    new_args = (*c_consts, *b_consts, *new_carry)
+    out_vals = lax.while_p.bind(
+        *new_args,
+        cond_nconsts=cond_nconsts,
+        cond_jaxpr=new_cond_jaxpr,
+        body_nconsts=body_nconsts,
+        body_jaxpr=new_body_jaxpr,
+    )
+    out, logs = jtu.tree_unflatten(out_tree, out_vals)
+
     return out, logs

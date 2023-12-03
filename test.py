@@ -62,7 +62,7 @@ def test_scan():
 
 
 def test_fori():
-    # @jax.jit
+    @jax.jit
     @logify.logify
     def g():
         def sum_(a, b):  # compute a + b
@@ -90,7 +90,29 @@ def test_fori():
     print(json.dumps(logs, indent=2, default=str))
 
 
+def test_while():
+    @logify.logify
+    @jax.jit
+    def g():
+        def cond(carry):
+            return carry < 10
+
+        def body(carry):
+            logify.log("carry", carry, "mean")
+            logify.log("carry", carry)
+            return carry + 1
+
+        return lax.while_loop(cond, body, 0)
+
+    out, logs = g()
+    logs = logs.asdict()
+
+    print(out)
+    print(json.dumps(logs, indent=2, default=str))
+
+
 if __name__ == "__main__":
     # test_cond()
     # test_scan()
-    test_fori()
+    # test_fori()
+    test_while()
