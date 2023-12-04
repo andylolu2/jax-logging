@@ -4,7 +4,7 @@ from typing import Any, Sequence
 import jax._src.linear_util as lu
 import jax._src.tree_util as jtu
 from jax import lax
-from jax._src import core, source_info_util
+from jax._src import core, pjit, sharding_impls, source_info_util
 from jax._src.interpreters import ad, batching, mlir
 from jax._src.interpreters import partial_eval as pe
 from jax._src.util import safe_map, split_list
@@ -68,6 +68,8 @@ def logify_jaxpr_flat(
                 outvals, logs = log_scan(logs, *invals, **eqn.params)
             elif eqn.primitive is lax.while_p:
                 outvals, logs = log_while(logs, *invals, **eqn.params)
+            elif eqn.primitive is pjit.pjit_p:
+                outvals, logs = log_pjit(logs, *invals, **eqn.params)
             else:
                 outvals = eqn.primitive.bind(*invals, **eqn.params)
 
@@ -102,6 +104,36 @@ def jaxpr_to_logify_jaxpr(closed_jaxpr: core.ClosedJaxpr, log_tree: PyTreeDef, *
     return new_jaxpr, out_vals, out_tree
 
 
+# Lowering (becomes No-op)
+mlir.register_lowering(log_p, lambda ctx, *args, **kwargs: [])
+
+
+# vmap-before-logify
+def log_vmap(batched_args, batch_dims, *, log_tree):
+    size = next(
+        x.shape[dim]
+        for x, dim in zip(batched_args, batch_dims)
+        if dim is not batching.not_mapped
+    )
+    batched_args = (
+        batching.bdim_at_front(a, d, size) for a, d in zip(batched_args, batch_dims)
+    )
+    log_p.bind(*batched_args, log_tree=log_tree)
+    return [], ()
+
+
+batching.primitive_batchers[log_p] = log_vmap
+
+
+# jvp-before-logify
+def log_jvp(primals, tangents, *, log_tree):
+    log_p.bind(*primals, log_tree=log_tree)
+    return [], []
+
+
+ad.primitive_jvps[log_p] = log_jvp
+
+
 # LAX control-flow primitives transformations
 
 
@@ -118,7 +150,8 @@ def log_cond(
     linear: tuple[bool, ...],
 ):
     log_values, log_tree = jtu.tree_flatten(prev_logs)
-    in_avals = tuple(map(_get_shaped_aval, [*log_values, *args]))
+    in_vals = [*log_values, *args]
+    in_avals = map(_get_shaped_aval, in_vals)
     new_branches, _, out_trees = zip(
         *map(lambda jaxpr: jaxpr_to_logify_jaxpr(jaxpr, log_tree, *in_avals), branches)
     )
@@ -128,7 +161,7 @@ def log_cond(
     if any(out_tree != out_trees[0] for out_tree in out_trees):
         raise ValueError("Logs must have the same shape for all conditional branches")
 
-    out_vals = lax.cond_p.bind(index, *args, branches=new_branches, linear=new_linear)
+    out_vals = lax.cond_p.bind(index, *in_vals, branches=new_branches, linear=new_linear)
 
     out, logs = jtu.tree_unflatten(out_trees[0], out_vals)
     return out, logs
@@ -142,7 +175,6 @@ def _trace_logs(logs: Logs, jaxpr: core.ClosedJaxpr, *in_avals: core.AbstractVal
     return new_jaxpr, logs
 
 
-# lax.scan
 def log_scan(
     prev_logs: Logs,
     *args,
@@ -264,6 +296,47 @@ def log_while(
         cond_jaxpr=new_cond_jaxpr,
         body_nconsts=body_nconsts,
         body_jaxpr=new_body_jaxpr,
+    )
+    out, logs = jtu.tree_unflatten(out_tree, out_vals)
+
+    return out, logs
+
+
+def log_pjit(
+    prev_logs: Logs,
+    *args,
+    jaxpr: core.ClosedJaxpr,
+    in_shardings,
+    out_shardings,
+    resource_env,
+    donated_invars,
+    name,
+    inline,
+    keep_unused,
+):
+    log_values, log_tree = jtu.tree_flatten(prev_logs)
+    in_vals = [*log_values, *args]
+    in_avals = tuple(map(_get_shaped_aval, in_vals))
+    new_jaxpr, out_avals, out_tree = jaxpr_to_logify_jaxpr(jaxpr, log_tree, *in_avals)
+
+    num_log_values = len(log_values)
+    num_out_log_values = len(out_avals) - len(out_shardings)
+    sharding = sharding_impls.UNSPECIFIED
+
+    new_in_shardings = (*[sharding] * num_log_values, *in_shardings)
+    new_out_shardings = (*[sharding] * num_out_log_values, *out_shardings)
+    new_donated_invars = (*[False] * num_log_values, *donated_invars)
+
+    out_vals = pjit.pjit_p.bind(
+        *in_vals,
+        jaxpr=new_jaxpr,
+        in_shardings=new_in_shardings,
+        out_shardings=new_out_shardings,
+        resource_env=resource_env,
+        donated_invars=new_donated_invars,
+        name=name,
+        inline=inline,
+        keep_unused=keep_unused,
     )
     out, logs = jtu.tree_unflatten(out_tree, out_vals)
 

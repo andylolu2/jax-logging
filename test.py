@@ -1,4 +1,5 @@
 import json
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -8,9 +9,9 @@ import logify
 
 
 def test_cond():
-    @jax.jit
-    @jax.vmap
+    # @jax.jit
     @logify.logify
+    @jax.grad
     def f(a):
         def yes():
             logify.log("a_yes", a)
@@ -22,14 +23,15 @@ def test_cond():
 
         a_sum = lax.cond(a.sum() > 0, yes, no)
 
-        return a_sum
+        return a_sum.sum()
 
-    a = jnp.arange(-3, 3)
-    out, logs = f(a)
-    logs = logs.asdict()
+    a = jnp.arange(-3, 3, dtype=jnp.float32)
+    print(f(a))
+    # out, logs = f(a)
+    # logs = logs.asdict()
 
-    print(out)
-    print(json.dumps(logs, indent=2, default=str))
+    # print(out)
+    # print(json.dumps(logs, indent=2, default=str))
 
 
 def test_scan():
@@ -112,7 +114,7 @@ def test_while():
 
 
 if __name__ == "__main__":
-    # test_cond()
+    test_cond()
     # test_scan()
     # test_fori()
-    test_while()
+    # test_while()
